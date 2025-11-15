@@ -1,9 +1,9 @@
 :root {
-  font-family: 'Pretendard', 'Inter', 'Noto Sans KR', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-family: 'Times New Roman', 'Pretendard', serif;
   line-height: 1.5;
   font-weight: 400;
-  color: #e2e8f0;
-  background-color: #050816;
+  color: #111;
+  background-color: #fff;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
 }
@@ -12,24 +12,25 @@
   box-sizing: border-box;
 }
 
-a {
-  color: inherit;
-}
-
-a:focus-visible,
-button:focus-visible,
-input:focus-visible {
-  outline: 2px solid #38bdf8;
-  outline-offset: 2px;
-}
-
 body {
   margin: 0;
   min-height: 100vh;
-  background: radial-gradient(circle at top, #0f172a, #050816 55%);
+  background-color: #fff;
   color: inherit;
+  display: flex;
+  flex-direction: column;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
 }
 
 button {
+  font-family: inherit;
+}
+
+input,
+select {
   font-family: inherit;
 }
