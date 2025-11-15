@@ -1,18 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import JSZip from 'jszip'
-import { decode as decodeJpeg } from '@jsquash/jpeg'
-import { decode as decodePng } from '@jsquash/png'
 import { encode as encodeAvif } from '@jsquash/avif'
 import { encode as encodeWebp } from '@jsquash/webp'
-import { init as initJpeg } from '@jsquash/jpeg/decode'
-import { init as initPng } from '@jsquash/png/decode'
 import { init as initAvifCodec } from '@jsquash/avif/encode'
 import { init as initWebpCodec } from '@jsquash/webp/encode'
 import avifMtWasmUrl from '@jsquash/avif/codec/enc/avif_enc_mt.wasm?url'
 import avifSingleWasmUrl from '@jsquash/avif/codec/enc/avif_enc.wasm?url'
 import avifWorkerUrl from '@jsquash/avif/codec/enc/avif_enc_mt.worker.mjs?url'
-import mozjpegDecWasmUrl from '@jsquash/jpeg/codec/dec/mozjpeg_dec.wasm?url'
-import pngWasmUrl from '@jsquash/png/codec/pkg/squoosh_png_bg.wasm?url'
 import webpWasmUrl from '@jsquash/webp/codec/enc/webp_enc.wasm?url'
 import webpSimdWasmUrl from '@jsquash/webp/codec/enc/webp_enc_simd.wasm?url'
 import './App.css'
@@ -45,10 +39,6 @@ const buildLocateFile = (mapping: Record<string, string>) => {
     return match ? match[1] : path
   }
 }
-
-const JPEG_LOCATE_FILE = buildLocateFile({
-  'mozjpeg_dec.wasm': mozjpegDecWasmUrl,
-})
 
 const AVIF_LOCATE_FILE = buildLocateFile({
   'avif_enc_mt.wasm': avifMtWasmUrl,
@@ -94,6 +84,65 @@ const triggerDownload = (blob: Blob, filename: string) => {
   URL.revokeObjectURL(url)
 }
 
+type DrawingContext = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D
+
+const createDrawingContext = (width: number, height: number): DrawingContext => {
+  if (typeof OffscreenCanvas !== 'undefined') {
+    const canvas = new OffscreenCanvas(width, height)
+    const context = canvas.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' })
+    if (!context) {
+      throw new Error('이미지를 처리할 수 없어요.')
+    }
+    return context
+  }
+
+  const canvas = document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' })
+  if (!context) {
+    throw new Error('이미지를 처리할 수 없어요.')
+  }
+  return context
+}
+
+const loadImageElement = (file: File) =>
+  new Promise<HTMLImageElement>((resolve, reject) => {
+    const url = URL.createObjectURL(file)
+    const image = new Image()
+    image.decoding = 'async'
+    image.onload = () => {
+      URL.revokeObjectURL(url)
+      resolve(image)
+    }
+    image.onerror = () => {
+      URL.revokeObjectURL(url)
+      reject(new Error('이미지를 불러오지 못했어요.'))
+    }
+    image.src = url
+  })
+
+const readImageData = async (file: File) => {
+  if (typeof createImageBitmap === 'function') {
+    const bitmap = await createImageBitmap(file, {
+      colorSpaceConversion: 'default',
+      premultiplyAlpha: 'none',
+    })
+    const context = createDrawingContext(bitmap.width, bitmap.height)
+    context.drawImage(bitmap, 0, 0)
+    const imageData = context.getImageData(0, 0, bitmap.width, bitmap.height)
+    bitmap.close()
+    return imageData
+  }
+
+  const image = await loadImageElement(file)
+  const width = image.naturalWidth || image.width
+  const height = image.naturalHeight || image.height
+  const context = createDrawingContext(width, height)
+  context.drawImage(image, 0, 0, width, height)
+  return context.getImageData(0, 0, width, height)
+}
+
 function App() {
   const [jobs, setJobs] = useState<ConversionJob[]>([])
   const [isDragging, setIsDragging] = useState(false)
@@ -110,8 +159,6 @@ function App() {
     if (!codecInitRef.current) {
       codecInitRef.current = (async () => {
         await Promise.all([
-          initJpeg({ locateFile: JPEG_LOCATE_FILE }),
-          initPng(pngWasmUrl),
           initAvifCodec({ locateFile: AVIF_LOCATE_FILE }),
           initWebpCodec({ locateFile: WEBP_LOCATE_FILE }),
         ])
@@ -126,13 +173,8 @@ function App() {
 
       try {
         await ensureCodecsReady()
-        const buffer = await job.file.arrayBuffer()
         updateJob(job.id, { progress: 35 })
-
-        const imageData =
-          job.sourceType === 'image/jpeg'
-            ? await decodeJpeg(buffer)
-            : await decodePng(buffer)
+        const imageData = await readImageData(job.file)
 
         updateJob(job.id, { progress: 65 })
 
