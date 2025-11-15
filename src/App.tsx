@@ -1,30 +1,16 @@
-import { useCallback, useMemo, useRef, useState, type DragEvent } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type DragEvent } from 'react'
 import JSZip from 'jszip'
-import { encode as encodeAvif } from '@jsquash/avif'
-import { encode as encodeWebp } from '@jsquash/webp'
-import { decode as decodeJpeg } from '@jsquash/jpeg'
-import { decode as decodePng } from '@jsquash/png'
-import encodeJpeg, { init as initJpegEncoder } from '@jsquash/jpeg/encode'
-import encodePng, { init as initPngEncoder } from '@jsquash/png/encode'
-import { init as initAvifCodec } from '@jsquash/avif/encode'
-import { init as initWebpCodec } from '@jsquash/webp/encode'
-import { init as initJpeg } from '@jsquash/jpeg/decode'
-import { init as initPng } from '@jsquash/png/decode'
-import avifMtWasmUrl from '@jsquash/avif/codec/enc/avif_enc_mt.wasm?url'
-import avifSingleWasmUrl from '@jsquash/avif/codec/enc/avif_enc.wasm?url'
-import avifWorkerUrl from '@jsquash/avif/codec/enc/avif_enc_mt.worker.mjs?url'
-import mozjpegDecWasmUrl from '@jsquash/jpeg/codec/dec/mozjpeg_dec.wasm?url'
-import mozjpegEncWasmUrl from '@jsquash/jpeg/codec/enc/mozjpeg_enc.wasm?url'
-import pngWasmUrl from '@jsquash/png/codec/pkg/squoosh_png_bg.wasm?url'
-import webpWasmUrl from '@jsquash/webp/codec/enc/webp_enc.wasm?url'
-import webpSimdWasmUrl from '@jsquash/webp/codec/enc/webp_enc_simd.wasm?url'
 import './App.css'
-
-type SourceType = 'image/jpeg' | 'image/png'
-type TargetType = 'image/avif' | 'image/webp' | 'image/jpeg' | 'image/png' | 'image/tiff'
-type ConversionStatus = 'pending' | 'processing' | 'done' | 'error'
-type ColorProfile = 'srgb' | 'adobe-rgb' | 'unknown'
-type WorkingColorProfile = Exclude<ColorProfile, 'unknown'>
+import { COLOR_OPTIONS, FORMAT_LOOKUP, FORMAT_OPTIONS, SOURCE_LABELS } from './lib/constants'
+import type {
+  ColorProfile,
+  ConversionStatus,
+  SourceType,
+  TargetType,
+  WorkerConvertRequest,
+  WorkerResponse,
+  WorkingColorProfile,
+} from './lib/types'
 
 type ConversionJob = {
   id: string
@@ -42,56 +28,72 @@ type ConversionJob = {
   sourceProfile?: ColorProfile
 }
 
-const FORMAT_OPTIONS: Array<{ value: TargetType; label: string; extension: string; supportsQuality: boolean }> = [
-  { value: 'image/avif', label: 'AVIF', extension: 'avif', supportsQuality: true },
-  { value: 'image/webp', label: 'WebP', extension: 'webp', supportsQuality: true },
-  { value: 'image/jpeg', label: 'JPEG', extension: 'jpg', supportsQuality: true },
-  { value: 'image/png', label: 'PNG', extension: 'png', supportsQuality: false },
-  { value: 'image/tiff', label: 'TIFF', extension: 'tiff', supportsQuality: false },
-]
+const workerFactory = () => new Worker(new URL('./workers/conversionWorker.ts', import.meta.url), { type: 'module' })
 
-const FORMAT_LOOKUP: Record<TargetType, { label: string; extension: string; supportsQuality: boolean }> = FORMAT_OPTIONS.reduce(
-  (acc, option) => ({ ...acc, [option.value]: { label: option.label, extension: option.extension, supportsQuality: option.supportsQuality } }),
-  {} as Record<TargetType, { label: string; extension: string; supportsQuality: boolean }>,
-)
-
-const COLOR_OPTIONS: Array<{ value: WorkingColorProfile; label: string }> = [
-  { value: 'srgb', label: 'sRGB' },
-  { value: 'adobe-rgb', label: 'Adobe RGB' },
-]
-
-const SOURCE_LABELS: Record<SourceType, string> = {
-  'image/jpeg': 'JPEG',
-  'image/png': 'PNG',
+type WorkerWrapper = {
+  worker: Worker
+  busy: boolean
+  currentTaskId?: string
 }
 
-const buildLocateFile = (mapping: Record<string, string>) => {
-  const entries = Object.entries(mapping)
-  return (path: string) => {
-    const sanitizedPath = path.split('?')[0]?.split('#')[0] ?? path
-    const match = entries.find(([suffix]) => sanitizedPath.endsWith(suffix))
-    return match ? match[1] : path
+class ConversionWorkerPool {
+  private workers: WorkerWrapper[]
+  private queue: WorkerConvertRequest[] = []
+  private onMessage: (message: WorkerResponse) => void
+
+  constructor(size: number, onMessage: (message: WorkerResponse) => void) {
+    this.onMessage = onMessage
+    this.workers = Array.from({ length: size }, () => this.createWorker())
+  }
+
+  private createWorker(): WorkerWrapper {
+    const worker = workerFactory()
+    const wrapper: WorkerWrapper = { worker, busy: false }
+    worker.onmessage = (event) => {
+      const message = event.data as WorkerResponse
+      this.handleMessage(wrapper, message)
+    }
+    worker.onerror = (event) => {
+      console.error('Worker error', event)
+      const currentId = wrapper.currentTaskId
+      if (currentId) {
+        this.onMessage({ type: 'error', id: currentId, error: event.message } satisfies WorkerResponse)
+      }
+      wrapper.busy = false
+      wrapper.currentTaskId = undefined
+      this.dispatch()
+    }
+    return wrapper
+  }
+
+  private handleMessage(wrapper: WorkerWrapper, message: WorkerResponse) {
+    if (message.type === 'done' || message.type === 'error') {
+      wrapper.busy = false
+      wrapper.currentTaskId = undefined
+      this.dispatch()
+    }
+    this.onMessage(message)
+  }
+
+  enqueue(command: WorkerConvertRequest) {
+    this.queue.push(command)
+    this.dispatch()
+  }
+
+  private dispatch() {
+    const wrapper = this.workers.find((worker) => !worker.busy)
+    if (!wrapper) return
+    const command = this.queue.shift()
+    if (!command) return
+    wrapper.busy = true
+    wrapper.currentTaskId = command.id
+    wrapper.worker.postMessage(command, [command.buffer])
+  }
+
+  terminate() {
+    this.workers.forEach((wrapper) => wrapper.worker.terminate())
   }
 }
-
-const JPEG_DECODE_LOCATE_FILE = buildLocateFile({
-  'mozjpeg_dec.wasm': mozjpegDecWasmUrl,
-})
-
-const JPEG_ENCODE_LOCATE_FILE = buildLocateFile({
-  'mozjpeg_enc.wasm': mozjpegEncWasmUrl,
-})
-
-const AVIF_LOCATE_FILE = buildLocateFile({
-  'avif_enc_mt.wasm': avifMtWasmUrl,
-  'avif_enc.wasm': avifSingleWasmUrl,
-  'avif_enc_mt.worker.mjs': avifWorkerUrl,
-})
-
-const WEBP_LOCATE_FILE = buildLocateFile({
-  'webp_enc_simd.wasm': webpSimdWasmUrl,
-  'webp_enc.wasm': webpWasmUrl,
-})
 
 const createJobId = () => {
   if (typeof crypto !== 'undefined' && 'randomUUID' in crypto) {
@@ -114,297 +116,6 @@ const triggerDownload = (blob: Blob, filename: string) => {
   URL.revokeObjectURL(url)
 }
 
-const clamp01 = (value: number) => Math.min(1, Math.max(0, value))
-
-const srgbToLinear = (value: number) => {
-  const c = clamp01(value)
-  if (c <= 0.04045) return c / 12.92
-  return Math.pow((c + 0.055) / 1.055, 2.4)
-}
-
-const linearToSrgb = (value: number) => {
-  const c = clamp01(value)
-  if (c <= 0.0031308) return c * 12.92
-  return 1.055 * Math.pow(c, 1 / 2.4) - 0.055
-}
-
-const ADOBE_GAMMA = 563 / 256
-
-const adobeRgbToLinear = (value: number) => Math.pow(clamp01(value), ADOBE_GAMMA)
-const linearToAdobeRgb = (value: number) => Math.pow(clamp01(value), 1 / ADOBE_GAMMA)
-
-const SRGB_TO_XYZ = [
-  [0.4124564, 0.3575761, 0.1804375],
-  [0.2126729, 0.7151522, 0.072175],
-  [0.0193339, 0.119192, 0.9503041],
-]
-
-const XYZ_TO_SRGB = [
-  [3.2406, -1.5372, -0.4986],
-  [-0.9689, 1.8758, 0.0415],
-  [0.0557, -0.204, 1.057],
-]
-
-const ADOBE_TO_XYZ = [
-  [0.5767309, 0.185554, 0.1881852],
-  [0.2973769, 0.6273491, 0.0752741],
-  [0.0270343, 0.0706872, 0.9911085],
-]
-
-const XYZ_TO_ADOBE = [
-  [2.041369, -0.5649464, -0.3446944],
-  [-0.969266, 1.8760108, 0.041556],
-  [0.0134474, -0.1183897, 1.0154096],
-]
-
-type ColorProfileConfig = {
-  toLinear: (value: number) => number
-  fromLinear: (value: number) => number
-  rgbToXyz: number[][]
-  xyzToRgb: number[][]
-}
-
-const COLOR_PROFILE_DEFINITIONS: Record<WorkingColorProfile, ColorProfileConfig> = {
-  srgb: {
-    toLinear: srgbToLinear,
-    fromLinear: linearToSrgb,
-    rgbToXyz: SRGB_TO_XYZ,
-    xyzToRgb: XYZ_TO_SRGB,
-  },
-  'adobe-rgb': {
-    toLinear: adobeRgbToLinear,
-    fromLinear: linearToAdobeRgb,
-    rgbToXyz: ADOBE_TO_XYZ,
-    xyzToRgb: XYZ_TO_ADOBE,
-  },
-}
-
-const multiplyMatrix = (matrix: number[][], vector: [number, number, number]) => {
-  const [r, g, b] = vector
-  return [
-    matrix[0][0] * r + matrix[0][1] * g + matrix[0][2] * b,
-    matrix[1][0] * r + matrix[1][1] * g + matrix[1][2] * b,
-    matrix[2][0] * r + matrix[2][1] * g + matrix[2][2] * b,
-  ] as [number, number, number]
-}
-
-const PROFILE_DECODER = new TextDecoder('latin1')
-
-const detectJpegColorProfile = (buffer: ArrayBuffer): ColorProfile => {
-  const bytes = new Uint8Array(buffer)
-  if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return 'unknown'
-
-  let offset = 2
-  while (offset + 4 < bytes.length) {
-    if (bytes[offset] !== 0xff) {
-      offset += 1
-      continue
-    }
-
-    const marker = bytes[offset + 1]
-    offset += 2
-
-    if (marker === 0xda || marker === 0xd9) break
-
-    const length = (bytes[offset] << 8) | bytes[offset + 1]
-    offset += 2
-
-    if (length < 2 || offset + length - 2 > bytes.length) break
-
-    if (marker === 0xe2) {
-      const segment = bytes.subarray(offset, offset + length - 2)
-      if (segment.length >= 14) {
-        const identifier = PROFILE_DECODER.decode(segment.subarray(0, 11))
-        if (identifier.startsWith('ICC_PROFILE')) {
-          const payload = PROFILE_DECODER.decode(segment)
-          if (/Adobe\s?RGB/i.test(payload)) return 'adobe-rgb'
-          if (/sRGB/i.test(payload) || /IEC61966/i.test(payload)) return 'srgb'
-        }
-      }
-    }
-
-    offset += length - 2
-  }
-
-  return 'unknown'
-}
-
-const decodeSourceImage = async (sourceType: SourceType, buffer: ArrayBuffer) => {
-  if (sourceType === 'image/jpeg') {
-    const profile = detectJpegColorProfile(buffer)
-    const imageData = await decodeJpeg(buffer)
-    return { imageData, profile }
-  }
-  const imageData = await decodePng(buffer)
-  return { imageData, profile: 'srgb' as ColorProfile }
-}
-
-const resolveWorkingProfile = (profile: ColorProfile): WorkingColorProfile =>
-  profile === 'adobe-rgb' ? 'adobe-rgb' : 'srgb'
-
-const convertColorSpace = (imageData: ImageData, fromProfile: WorkingColorProfile, toProfile: WorkingColorProfile) => {
-  if (fromProfile === toProfile) return imageData
-
-  const sourceConfig = COLOR_PROFILE_DEFINITIONS[fromProfile]
-  const targetConfig = COLOR_PROFILE_DEFINITIONS[toProfile]
-  const data = imageData.data
-
-  for (let i = 0; i < data.length; i += 4) {
-    const rLinear = sourceConfig.toLinear(data[i] / 255)
-    const gLinear = sourceConfig.toLinear(data[i + 1] / 255)
-    const bLinear = sourceConfig.toLinear(data[i + 2] / 255)
-
-    const [x, y, z] = multiplyMatrix(sourceConfig.rgbToXyz, [rLinear, gLinear, bLinear])
-    const [tr, tg, tb] = multiplyMatrix(targetConfig.xyzToRgb, [x, y, z])
-
-    data[i] = Math.round(targetConfig.fromLinear(tr) * 255)
-    data[i + 1] = Math.round(targetConfig.fromLinear(tg) * 255)
-    data[i + 2] = Math.round(targetConfig.fromLinear(tb) * 255)
-  }
-
-  return imageData
-}
-
-type DrawingContext = CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D
-type CanvasSurface = {
-  canvas: HTMLCanvasElement | OffscreenCanvas
-  context: DrawingContext
-}
-
-const createSurface = (width: number, height: number): CanvasSurface => {
-  if (typeof OffscreenCanvas !== 'undefined') {
-    const canvas = new OffscreenCanvas(width, height)
-    const context = canvas.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' })
-    if (!context) throw new Error('이미지를 처리할 수 없어요.')
-    return { canvas, context }
-  }
-
-  const canvas = document.createElement('canvas')
-  canvas.width = width
-  canvas.height = height
-  const context = canvas.getContext('2d', { willReadFrequently: true, colorSpace: 'srgb' })
-  if (!context) throw new Error('이미지를 처리할 수 없어요.')
-  return { canvas, context }
-}
-
-const surfaceFromImageData = (imageData: ImageData) => {
-  const surface = createSurface(imageData.width, imageData.height)
-  surface.context.putImageData(imageData, 0, 0)
-  return surface
-}
-
-const resizeImageData = (imageData: ImageData, shortEdge?: number | null) => {
-  if (!shortEdge || shortEdge <= 0) return imageData
-
-  const currentShort = Math.min(imageData.width, imageData.height)
-  if (currentShort === shortEdge) return imageData
-
-  const scale = shortEdge / currentShort
-  const targetWidth = Math.max(1, Math.round(imageData.width * scale))
-  const targetHeight = Math.max(1, Math.round(imageData.height * scale))
-
-  if (targetWidth === imageData.width && targetHeight === imageData.height) return imageData
-
-  const sourceSurface = surfaceFromImageData(imageData)
-  const targetSurface = createSurface(targetWidth, targetHeight)
-  targetSurface.context.drawImage(sourceSurface.canvas as CanvasImageSource, 0, 0, targetWidth, targetHeight)
-  return targetSurface.context.getImageData(0, 0, targetWidth, targetHeight)
-}
-
-const mapAvifQuality = (uiValue: number) => {
-  const normalized = Math.min(100, Math.max(0, uiValue))
-  const encoderValue = Math.round((normalized / 100) * 63)
-  return Math.max(1, encoderValue)
-}
-
-const encodeTiff = (imageData: ImageData) => {
-  const width = imageData.width
-  const height = imageData.height
-  const rgbData = new Uint8Array(width * height * 3)
-  for (let src = 0, dst = 0; src < imageData.data.length; src += 4, dst += 3) {
-    rgbData[dst] = imageData.data[src]
-    rgbData[dst + 1] = imageData.data[src + 1]
-    rgbData[dst + 2] = imageData.data[src + 2]
-  }
-
-  const entryCount = 10
-  const headerSize = 8
-  const ifdSize = 2 + entryCount * 12 + 4
-  const bitsPerSampleSize = 6
-  const bitsPerSampleOffset = headerSize + ifdSize
-  const imageOffset = bitsPerSampleOffset + bitsPerSampleSize
-  const totalSize = imageOffset + rgbData.byteLength
-
-  const buffer = new ArrayBuffer(totalSize)
-  const view = new DataView(buffer)
-
-  view.setUint8(0, 0x49)
-  view.setUint8(1, 0x49)
-  view.setUint16(2, 42, true)
-  view.setUint32(4, 8, true)
-
-  const ifdStart = 8
-  view.setUint16(ifdStart, entryCount, true)
-
-  const writeEntry = (index: number, tag: number, type: number, count: number, value: number) => {
-    const offset = ifdStart + 2 + index * 12
-    view.setUint16(offset, tag, true)
-    view.setUint16(offset + 2, type, true)
-    view.setUint32(offset + 4, count, true)
-    view.setUint32(offset + 8, value, true)
-  }
-
-  writeEntry(0, 256, 4, 1, width)
-  writeEntry(1, 257, 4, 1, height)
-  writeEntry(2, 258, 3, 3, bitsPerSampleOffset)
-  writeEntry(3, 259, 3, 1, 1)
-  writeEntry(4, 262, 3, 1, 2)
-  writeEntry(5, 273, 4, 1, imageOffset)
-  writeEntry(6, 277, 3, 1, 3)
-  writeEntry(7, 278, 4, 1, height)
-  writeEntry(8, 279, 4, 1, rgbData.byteLength)
-  writeEntry(9, 284, 3, 1, 1)
-
-  view.setUint32(ifdStart + 2 + entryCount * 12, 0, true)
-
-  new Uint16Array(buffer, bitsPerSampleOffset, 3).set([8, 8, 8])
-  new Uint8Array(buffer, imageOffset, rgbData.length).set(rgbData)
-
-  return buffer
-}
-
-const encodeByFormat = async (imageData: ImageData, job: ConversionJob) => {
-  if (job.targetType === 'image/avif') {
-    return encodeAvif(imageData, {
-      quality: mapAvifQuality(job.targetQuality),
-      enableSharpYUV: true,
-      chromaDeltaQ: true,
-      speed: 5,
-    })
-  }
-
-  if (job.targetType === 'image/webp') {
-    return encodeWebp(imageData, {
-      quality: job.targetQuality,
-      method: 6,
-      alpha_quality: 90,
-      use_sharp_yuv: 1,
-    })
-  }
-
-  if (job.targetType === 'image/jpeg') {
-    return encodeJpeg(imageData, {
-      quality: job.targetQuality,
-      progressive: true,
-    })
-  }
-
-  if (job.targetType === 'image/png') {
-    return encodePng(imageData, { bitDepth: 8 })
-  }
-
-  return encodeTiff(imageData)
-}
 
 function App() {
   const [jobs, setJobs] = useState<ConversionJob[]>([])
@@ -414,60 +125,58 @@ function App() {
   const [shortEdge, setShortEdge] = useState<number | null>(null)
   const [colorIntent, setColorIntent] = useState<WorkingColorProfile>('srgb')
   const fileInputRef = useRef<HTMLInputElement | null>(null)
-  const codecInitRef = useRef<Promise<void> | null>(null)
   const dragDepthRef = useRef(0)
+  const workerPoolRef = useRef<ConversionWorkerPool | null>(null)
 
-  const updateJob = useCallback((id: string, patch: Partial<ConversionJob>) => {
-    setJobs((prev) => prev.map((job) => (job.id === id ? { ...job, ...patch } : job)))
-  }, [])
-
-  const ensureCodecsReady = useCallback(() => {
-    if (!codecInitRef.current) {
-      codecInitRef.current = (async () => {
-        await Promise.all([
-          initJpeg({ locateFile: JPEG_DECODE_LOCATE_FILE }),
-          initPng(pngWasmUrl),
-          initAvifCodec({ locateFile: AVIF_LOCATE_FILE }),
-          initWebpCodec({ locateFile: WEBP_LOCATE_FILE }),
-          initJpegEncoder({ locateFile: JPEG_ENCODE_LOCATE_FILE }),
-          initPngEncoder(pngWasmUrl),
-        ])
-      })()
-    }
-    return codecInitRef.current
-  }, [])
-
-  const runConversion = useCallback(
-    async (job: ConversionJob) => {
-      updateJob(job.id, { status: 'processing', progress: 10, error: undefined })
-
-      try {
-        await ensureCodecsReady()
-        updateJob(job.id, { progress: 35 })
-
-        const buffer = await job.file.arrayBuffer()
-        const { imageData, profile } = await decodeSourceImage(job.sourceType, buffer)
-        updateJob(job.id, { progress: 55, sourceProfile: profile })
-
-        const resized = resizeImageData(imageData, job.shortEdge)
-        const workingProfile = resolveWorkingProfile(profile)
-        const converted = convertColorSpace(resized, workingProfile, job.targetColorSpace)
-
-        updateJob(job.id, { progress: 75 })
-        const encodedBuffer = await encodeByFormat(converted, job)
-
-        const blob = new Blob([encodedBuffer], { type: job.targetType })
-        const { extension } = FORMAT_LOOKUP[job.targetType]
-        const downloadName = buildOutputName(job.file.name, extension)
-
-        updateJob(job.id, { status: 'done', blob, downloadName, progress: 100 })
-      } catch (error) {
-        const message = error instanceof Error ? error.message : '예상하지 못한 오류가 발생했어요.'
-        updateJob(job.id, { status: 'error', error: message })
-      }
+  const updateJob = useCallback(
+    (id: string, patch: Partial<ConversionJob> | ((job: ConversionJob) => Partial<ConversionJob>)) => {
+      setJobs((prev) =>
+        prev.map((job) => {
+          if (job.id !== id) return job
+          const nextPatch = typeof patch === 'function' ? patch(job) : patch
+          return { ...job, ...nextPatch }
+        }),
+      )
     },
-    [ensureCodecsReady, updateJob],
+    [],
   )
+
+  const handleWorkerMessage = useCallback(
+    (message: WorkerResponse) => {
+      if (message.type === 'progress') {
+        updateJob(message.id, { progress: Math.min(99, message.progress) })
+        return
+      }
+
+      if (message.type === 'done') {
+        const blob = new Blob([message.buffer], { type: message.mime })
+        updateJob(message.id, (job) => {
+          const { extension } = FORMAT_LOOKUP[job.targetType]
+          const downloadName = buildOutputName(job.file.name, extension)
+          return {
+            status: 'done',
+            progress: 100,
+            blob,
+            downloadName,
+            sourceProfile: message.sourceProfile,
+          }
+        })
+        return
+      }
+
+      updateJob(message.id, { status: 'error', error: message.error })
+    },
+    [updateJob],
+  )
+
+  useEffect(() => {
+    const pool = new ConversionWorkerPool(8, handleWorkerMessage)
+    workerPoolRef.current = pool
+    return () => {
+      pool.terminate()
+      workerPoolRef.current = null
+    }
+  }, [handleWorkerMessage])
 
   const addFiles = useCallback(
     (files: FileList | File[]) => {
@@ -508,6 +217,19 @@ function App() {
   )
 
   const pendingJobs = useMemo(() => jobs.filter((job) => job.status === 'pending'), [jobs])
+  useEffect(() => {
+    setJobs((prev) => {
+      let mutated = false
+      const next = prev.map((job) => {
+        if (job.status !== 'pending' || job.targetQuality === quality) {
+          return job
+        }
+        mutated = true
+        return { ...job, targetQuality: quality }
+      })
+      return mutated ? next : prev
+    })
+  }, [quality])
   const handleDrop = (event: DragEvent<HTMLDivElement | HTMLBodyElement>) => {
     event.preventDefault()
     dragDepthRef.current = 0
@@ -522,7 +244,7 @@ function App() {
   }
 
   const finishedJobs = useMemo(() => jobs.filter((job) => job.status === 'done' && job.blob), [jobs])
-  const activeJobs = useMemo(() => jobs.filter((job) => job.status === 'processing' || job.status === 'pending'), [jobs])
+  const activeJobs = useMemo(() => jobs.filter((job) => job.status === 'processing'), [jobs])
 
   const handleDownloadSingle = (job: ConversionJob) => {
     if (!job.blob || !job.downloadName) return
@@ -545,8 +267,35 @@ function App() {
 
   const formatSupportsQuality = FORMAT_LOOKUP[targetFormat].supportsQuality
   const handleStartConversion = () => {
+    if (formatSupportsQuality && quality === 0) {
+      window.alert('Increase quality above 0 to start conversion.')
+      return
+    }
+
+    const pool = workerPoolRef.current
+    if (!pool) return
     pendingJobs.forEach((job) => {
-      runConversion(job)
+      updateJob(job.id, { status: 'processing', progress: 5, error: undefined })
+      job.file
+        .arrayBuffer()
+        .then((buffer) => {
+          pool.enqueue({
+            id: job.id,
+            fileName: job.file.name,
+            sourceType: job.sourceType,
+            targetType: job.targetType,
+            targetColorSpace: job.targetColorSpace,
+            targetQuality: job.targetQuality,
+            shortEdge: job.shortEdge,
+            buffer,
+          })
+        })
+        .catch((error) => {
+          updateJob(job.id, {
+            status: 'error',
+            error: error instanceof Error ? error.message : 'Failed to read file.',
+          })
+        })
     })
   }
 
@@ -573,12 +322,7 @@ function App() {
       <div className={`drag-overlay ${isDragging ? 'visible' : ''}`}>Drop images to queue</div>
 
       <header className="site-header">
-        <div className="logo">
-          <a href="#">
-            <span className="original-name">Studio Convert</span>
-            <span className="hover-name">Jiwon Choi Atelier</span>
-          </a>
-        </div>
+        <div className="logo">SEUNGWON BABO</div>
         <nav className="main-nav">
           <ul>
             <li>Queue {jobs.length}</li>
@@ -625,7 +369,7 @@ function App() {
             <input
               type="number"
               min={0}
-              placeholder="원본"
+              placeholder="Original"
               value={shortEdge ?? ''}
               onChange={(event) => {
                 if (event.target.value === '') {
@@ -653,12 +397,12 @@ function App() {
               type="range"
               min={0}
               max={100}
-              step={10}
+              step={1}
               value={quality}
               onChange={(event) => setQuality(Number(event.target.value))}
               disabled={!formatSupportsQuality}
             />
-            <span>{formatSupportsQuality ? quality : '고정'}</span>
+            <span>{formatSupportsQuality ? quality : 'Fixed'}</span>
           </label>
           <button type="button" className="primary" onClick={handleStartConversion} disabled={!pendingJobs.length}>
             Start conversion
@@ -687,8 +431,8 @@ function App() {
               const profileLabel = job.sourceProfile
                 ? `${job.sourceProfile === 'unknown' ? 'sRGB' : job.sourceProfile.toUpperCase()} → ${job.targetColorSpace.toUpperCase()}`
                 : `→ ${job.targetColorSpace.toUpperCase()}`
-              const shortEdgeLabel = job.shortEdge ? `${job.shortEdge}px` : '원본'
-              const qualityLabel = supportsQuality ? `${job.targetQuality}` : '고정'
+              const shortEdgeLabel = job.shortEdge ? `${job.shortEdge}px` : 'Original'
+              const qualityLabel = supportsQuality ? `${job.targetQuality}` : 'Fixed'
 
               return (
                 <article key={job.id} className={`job-card status-${job.status}`}>
@@ -702,8 +446,21 @@ function App() {
                     <div className="job-status">
                       {job.status === 'processing' && <span>Processing</span>}
                       {job.status === 'pending' && <span>Waiting</span>}
-                      {job.status === 'done' && <span>Done</span>}
                       {job.status === 'error' && <span>Error</span>}
+                      {job.status === 'done' && (
+                        <span>
+                          Done
+                          {job.blob && job.downloadName && (
+                            <>
+                              {' '}
+                              ·{' '}
+                              <button type="button" className="inline-download" onClick={() => handleDownloadSingle(job)}>
+                                download
+                              </button>
+                            </>
+                          )}
+                        </span>
+                      )}
                     </div>
                   </div>
 
@@ -718,14 +475,6 @@ function App() {
                   </div>
 
                   {job.status === 'error' && <p className="job-error">{job.error}</p>}
-
-                  {job.status === 'done' && job.blob && job.downloadName && (
-                    <div className="job-actions">
-                      <button type="button" onClick={() => handleDownloadSingle(job)}>
-                        Download
-                      </button>
-                    </div>
-                  )}
                 </article>
               )
             })}

@@ -34,30 +34,15 @@
   padding: 2rem clamp(1.5rem, 6vw, 5rem) 1rem;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-}
-
-.logo a {
-  text-decoration: none;
-  color: inherit;
-  position: relative;
-  display: inline-block;
-}
-
-.logo .hover-name {
-  position: absolute;
+  position: sticky;
   top: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  opacity: 0;
-  transition: opacity 0.2s ease;
+  z-index: 30;
+  background: #fff;
+  border-bottom: 1px solid #111;
 }
 
-.logo a:hover .original-name {
-  opacity: 0;
-}
-
-.logo a:hover .hover-name {
-  opacity: 1;
+.logo {
+  letter-spacing: 0.15em;
 }
 
 .main-nav ul {
@@ -85,6 +70,11 @@
 .control-panel {
   border-right: 1px solid #111;
   padding-right: 1.5rem;
+  position: sticky;
+  top: 6rem;
+  align-self: flex-start;
+  max-height: calc(100vh - 7rem);
+  overflow-y: auto;
 }
 
 .control-panel button,
@@ -126,12 +116,14 @@ button:disabled {
   padding: 0.55rem 0.6rem;
   background: transparent;
   font-family: inherit;
+  width: 100%;
 }
 
 .quality-control {
   display: flex;
   align-items: center;
   gap: 0.5rem;
+  width: 100%;
 }
 
 .quality-control span {
@@ -141,6 +133,9 @@ button:disabled {
 
 .quality-control input[type='range'] {
   flex: 1;
+  width: 100%;
+  accent-color: #111;
+  margin: 0;
 }
 
 .quality-control.is-disabled {
@@ -243,8 +238,19 @@ button:disabled {
   font-size: 0.85rem;
 }
 
-.job-actions button {
-  width: fit-content;
+.inline-download {
+  border: none;
+  background: none;
+  padding: 0;
+  font-size: 0.8rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  cursor: pointer;
+  color: #555;
+}
+
+.inline-download:hover {
+  color: #111;
 }
 
 .empty {
