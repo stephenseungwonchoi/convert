@@ -322,7 +322,7 @@ function App() {
       <div className={`drag-overlay ${isDragging ? 'visible' : ''}`}>Drop images to queue</div>
 
       <header className="site-header">
-        <div className="logo">SEUNGWON BABO</div>
+        <div className="logo">SW CHOI CONVERT</div>
         <nav className="main-nav">
           <ul>
             <li>Queue {jobs.length}</li>
